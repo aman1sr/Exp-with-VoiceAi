@@ -1,15 +1,14 @@
 import asyncio
 import re
-from collections import deque
+import time
 
 from fastapi import WebSocket
 
 from . import llm, stt, tts
 from .trace import Trace
-from .vad import SILENCE_MS, VAD
+from .vad import VAD
 
 SENTENCE_END = re.compile(r"[.!?]\s")
-PREROLL_FRAMES = 15
 
 
 async def sentences(text_stream, trace: Trace):
@@ -36,70 +35,62 @@ async def forward_audio(tts_ws, ws: WebSocket, trace: Trace):
 
 
 class Session:
-    """One browser connection with automatic speech and turn detection."""
+    """One browser connection with continuous STT and model-based turn detection."""
 
     def __init__(self, ws: WebSocket):
         self.ws = ws
         self.messages = []
         self.vad = VAD()
         self.state = "listening"
-        self.preroll = deque(maxlen=PREROLL_FRAMES)
         self.stt_ws = None
-        self.finals = []
+        self.chunk = b""
         self.reader = None
 
-    async def on_audio(self, frame: bytes):
-        """Detect turns and forward speech frames to STT."""
-        event = self.vad.process(frame)
-        self.preroll.append(frame)
-
-        if self.state == "listening" and event == "speech_start":
-            self.state = "user_speaking"
-            await self.ws.send_json({"type": "speech_start"})
-            await self.start_listening()
-            for old_frame in self.preroll:
-                await stt.send_audio(self.stt_ws, old_frame)
-
-        elif self.state == "user_speaking":
-            await stt.send_audio(self.stt_ws, frame)
-            if event == "speech_end":
-                self.state = "agent_turn"
-                await self.ws.send_json({"type": "speech_end", "silence_ms": SILENCE_MS})
-                asyncio.create_task(self.run_turn())
-
-    async def start_listening(self):
-        """Open STT when VAD detects speech."""
+    async def start(self):
+        """Open the continuous STT connection for this browser session."""
         self.stt_ws = await stt.connect()
-        self.finals = []
-        self.reader = asyncio.create_task(self.read_transcripts())
+        self.reader = asyncio.create_task(self.read_events())
 
-    async def read_transcripts(self):
-        """Collect final transcript segments and publish live interim text."""
-        async for text, is_final in stt.transcripts(self.stt_ws):
-            if is_final:
-                self.finals.append(text)
-            live = " ".join(self.finals if is_final else [*self.finals, text])
-            await self.ws.send_json({"type": "transcript", "text": live, "final": is_final})
+    async def on_audio(self, frame: bytes):
+        """Send continuous audio to Flux in its preferred 80 ms chunks."""
+        self.vad.process(frame)
+        self.chunk += frame
+        if len(self.chunk) >= len(frame) * stt.CHUNK_FRAMES:
+            await stt.send_audio(self.stt_ws, self.chunk)
+            self.chunk = b""
+
+    async def read_events(self):
+        """Use Flux turn events to update the session and publish live text."""
+        async for event, transcript in stt.events(self.stt_ws):
+            if self.state == "listening" and event == "StartOfTurn":
+                self.state = "user_speaking"
+                await self.ws.send_json({"type": "speech_start"})
+
+            if self.state != "user_speaking":
+                continue
+
+            final = event == "EndOfTurn"
+            await self.ws.send_json({"type": "transcript", "text": transcript, "final": final})
+            if final and transcript:
+                await self.end_of_turn(transcript)
+
+    async def end_of_turn(self, transcript: str):
+        """Start the response as soon as Flux returns its final turn transcript."""
+        self.state = "agent_turn"
+        last_speech_at = self.vad.last_speech_at
+        turn_detection_ms = round((time.perf_counter() - last_speech_at) * 1000) if last_speech_at else 0
+        await self.ws.send_json({"type": "speech_end", "turn_detection_ms": turn_detection_ms})
+        asyncio.create_task(self.run_turn(transcript, turn_detection_ms))
 
     async def playback_done(self):
-        """Reset turn detection after browser playback finishes."""
+        """Reset local speech timing after the browser finishes playback."""
         self.vad.reset()
-        self.preroll.clear()
         self.state = "listening"
 
-    async def run_turn(self):
-        """Finalize STT and run the existing streamed LLM/TTS response pipeline."""
+    async def run_turn(self, transcript: str, turn_detection_ms: int):
+        """Run the existing streamed LLM/TTS response pipeline for a completed turn."""
         trace = Trace()
-        await stt.finish(self.stt_ws)
-        await self.reader
-        self.stt_ws = None
-        transcript = " ".join(self.finals)
         trace.mark("stt_done")
-        if not transcript:
-            await self.ws.send_json({"type": "error", "message": "No speech detected"})
-            await self.playback_done()
-            return
-
         self.messages.append({"role": "user", "content": transcript})
         await self.ws.send_json({"type": "audio_start", "sample_rate": tts.SAMPLE_RATE})
         tts_ws = await tts.connect()
@@ -123,12 +114,12 @@ class Session:
             "transcript": transcript,
             "reply": reply.strip(),
             "timings": {
-                "turn_detection": SILENCE_MS,
+                "turn_detection": turn_detection_ms,
                 "stt": trace.marks["stt_done"],
                 "llm_first_token": trace.duration("stt_done", "llm_first_token"),
                 "llm_first_sentence": trace.duration("llm_first_token", "llm_first_sentence"),
                 "tts_first_byte": trace.duration("llm_first_sentence", "tts_first_byte"),
-                "first_audio": SILENCE_MS + trace.marks["tts_first_byte"],
-                "total": SILENCE_MS + trace.marks["audio_sent"],
+                "first_audio": turn_detection_ms + trace.marks["tts_first_byte"],
+                "total": turn_detection_ms + trace.marks["audio_sent"],
             },
         })

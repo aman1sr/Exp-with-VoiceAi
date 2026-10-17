@@ -10,8 +10,8 @@ Built for teaching at **Outcome School** by **Amit Shekhar** as part of the: [AI
 
 ## How to run
 
-Needs Python 3.11+, Chrome, a [Deepgram](https://deepgram.com) API key (speech to text
-and text to speech) and an [OpenRouter](https://openrouter.ai) API key (LLM).
+Needs Python 3.11+, Chrome, a [Deepgram](https://deepgram.com) API key (Flux turn detection,
+speech to text, and text to speech) and an [OpenRouter](https://openrouter.ai) API key (LLM).
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
@@ -21,4 +21,4 @@ cp -n .env.example .env      # creates .env only if it doesn't already exist
 uvicorn server.main:app --reload
 ```
 
-Open http://localhost:8000 in Chrome, click **Start** and allow the microphone. Speak naturally; server-side VAD detects speech boundaries, so no push-to-talk button is needed.
+Open http://localhost:8000 in Chrome, click **Start** and allow the microphone. Flux listens continuously and uses speech context to determine when your turn ends; Silero VAD remains for speech timing.

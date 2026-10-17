@@ -1,5 +1,5 @@
-import { startCapture } from "./capture.js?v=p4-1";
-import { Player } from "./playback.js?v=p4-1";
+import { startCapture } from "./capture.js?v=p5-1";
+import { Player } from "./playback.js?v=p5-1";
 
 const $ = (id) => document.getElementById(id);
 
@@ -56,7 +56,7 @@ async function start() {
 
   socket.onerror = () => {
     if (ws === socket && !startupComplete) {
-      showStartError("WebSocket connection failed. Check that the P4 server is running, then retry.");
+      showStartError("WebSocket connection failed. Check that the P5 server is running, then retry.");
     }
   };
 
@@ -92,7 +92,7 @@ async function start() {
       $("status").textContent = "you are speaking...";
       $("live").textContent = "";
     } else if (msg.type === "speech_end") {
-      speechEndAt = performance.now() - msg.silence_ms;
+      speechEndAt = performance.now() - msg.turn_detection_ms;
       $("status").textContent = "thinking...";
     } else if (msg.type === "audio_start") {
       sampleRate = msg.sample_rate;
@@ -134,7 +134,7 @@ function addTurn({ transcript, reply, timings: t }) {
   const expectedTimings = ["turn_detection", "stt", "llm_first_token", "llm_first_sentence", "tts_first_byte", "first_audio", "total"];
   const missingTimings = expectedTimings.filter((name) => !Number.isFinite(t?.[name]));
   if (missingTimings.length) {
-    console.warn("P4 timing fields missing from turn_done:", missingTimings, t);
+    console.warn("P5 timing fields missing from turn_done:", missingTimings, t);
   }
   $("turns").insertAdjacentHTML("afterbegin", `
     <tr>
