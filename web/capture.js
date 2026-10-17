@@ -14,7 +14,7 @@ export async function startCapture(onFrame) {
   try {
     // ask the browser for 16kHz directly, it resamples the mic for us
     ctx = new AudioContext({ sampleRate: 16000 });
-    await ctx.audioWorklet.addModule("worklet.js?v=p3-1");
+    await ctx.audioWorklet.addModule("worklet.js?v=p4-1");
 
     const source = ctx.createMediaStreamSource(stream);
     const node = new AudioWorkletNode(ctx, "pcm-frame-processor");

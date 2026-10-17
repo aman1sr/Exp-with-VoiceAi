@@ -12,6 +12,10 @@ export class Player {
     this.pendingByte = null;
   }
 
+  remainingMs() {
+    return Math.max(0, (this.nextTime - this.ctx.currentTime) * 1000);
+  }
+
   enqueue(arrayBuffer, sampleRate) {
     let bytes = new Uint8Array(arrayBuffer);
     if (this.pendingByte !== null) {

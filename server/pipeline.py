@@ -1,12 +1,15 @@
 import asyncio
 import re
+from collections import deque
 
 from fastapi import WebSocket
 
 from . import llm, stt, tts
 from .trace import Trace
+from .vad import SILENCE_MS, VAD
 
 SENTENCE_END = re.compile(r"[.!?]\s")
+PREROLL_FRAMES = 15
 
 
 async def sentences(text_stream, trace: Trace):
@@ -33,17 +36,39 @@ async def forward_audio(tts_ws, ws: WebSocket, trace: Trace):
 
 
 class Session:
-    """One browser connection: stream audio to STT, then reply to each utterance."""
+    """One browser connection with automatic speech and turn detection."""
 
     def __init__(self, ws: WebSocket):
         self.ws = ws
         self.messages = []
+        self.vad = VAD()
+        self.state = "listening"
+        self.preroll = deque(maxlen=PREROLL_FRAMES)
         self.stt_ws = None
         self.finals = []
         self.reader = None
 
+    async def on_audio(self, frame: bytes):
+        """Detect turns and forward speech frames to STT."""
+        event = self.vad.process(frame)
+        self.preroll.append(frame)
+
+        if self.state == "listening" and event == "speech_start":
+            self.state = "user_speaking"
+            await self.ws.send_json({"type": "speech_start"})
+            await self.start_listening()
+            for old_frame in self.preroll:
+                await stt.send_audio(self.stt_ws, old_frame)
+
+        elif self.state == "user_speaking":
+            await stt.send_audio(self.stt_ws, frame)
+            if event == "speech_end":
+                self.state = "agent_turn"
+                await self.ws.send_json({"type": "speech_end", "silence_ms": SILENCE_MS})
+                asyncio.create_task(self.run_turn())
+
     async def start_listening(self):
-        """Open STT before the browser starts sending microphone frames."""
+        """Open STT when VAD detects speech."""
         self.stt_ws = await stt.connect()
         self.finals = []
         self.reader = asyncio.create_task(self.read_transcripts())
@@ -56,13 +81,14 @@ class Session:
             live = " ".join(self.finals if is_final else [*self.finals, text])
             await self.ws.send_json({"type": "transcript", "text": live, "final": is_final})
 
-    async def on_audio(self, frame: bytes):
-        """Forward each microphone frame to Deepgram while the user is speaking."""
-        if self.stt_ws:
-            await stt.send_audio(self.stt_ws, frame)
+    async def playback_done(self):
+        """Reset turn detection after browser playback finishes."""
+        self.vad.reset()
+        self.preroll.clear()
+        self.state = "listening"
 
-    async def end_of_speech(self):
-        """Close STT, then run the existing streamed LLM/TTS response pipeline."""
+    async def run_turn(self):
+        """Finalize STT and run the existing streamed LLM/TTS response pipeline."""
         trace = Trace()
         await stt.finish(self.stt_ws)
         await self.reader
@@ -71,6 +97,7 @@ class Session:
         trace.mark("stt_done")
         if not transcript:
             await self.ws.send_json({"type": "error", "message": "No speech detected"})
+            await self.playback_done()
             return
 
         self.messages.append({"role": "user", "content": transcript})
@@ -96,11 +123,12 @@ class Session:
             "transcript": transcript,
             "reply": reply.strip(),
             "timings": {
+                "turn_detection": SILENCE_MS,
                 "stt": trace.marks["stt_done"],
                 "llm_first_token": trace.duration("stt_done", "llm_first_token"),
                 "llm_first_sentence": trace.duration("llm_first_token", "llm_first_sentence"),
                 "tts_first_byte": trace.duration("llm_first_sentence", "tts_first_byte"),
-                "first_audio": trace.marks["tts_first_byte"],
-                "total": trace.marks["audio_sent"],
+                "first_audio": SILENCE_MS + trace.marks["tts_first_byte"],
+                "total": SILENCE_MS + trace.marks["audio_sent"],
             },
         })
