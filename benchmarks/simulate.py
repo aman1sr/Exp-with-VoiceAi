@@ -1,7 +1,4 @@
-"""Simulated user for benchmarking without a microphone.
-
-Generates the question as speech with Deepgram TTS (16kHz, like our mic), streams it to the
-server one 20ms frame at a time, and prints every event with a timestamp.
+"""Simulate a spoken turn without a microphone.
 
     python benchmarks/simulate.py "What is the capital of India?"
 
@@ -55,29 +52,30 @@ async def stream(ws, pcm):
 
 async def main():
     pcm = await speech(QUESTION)
-    audio = silence(500) + pcm + silence(1500)
-    estimated_speech_end = 500 + len(pcm) / 32
+    audio = silence(600) + pcm + silence(2500)
 
     async with websockets.connect(SERVER, max_size=None) as ws:
         start = time.perf_counter()
         first_audio = None
+        speech_end_at = None
 
         async def read_events():
-            nonlocal first_audio
+            nonlocal first_audio, speech_end_at
             async for message in ws:
                 elapsed = (time.perf_counter() - start) * 1000
                 if isinstance(message, bytes):
                     if first_audio is None:
                         first_audio = elapsed
-                        print(
-                            f"  first audio @ {first_audio:.0f} ms"
-                            f"  ->  V2V from estimated speech end: {first_audio - estimated_speech_end:.0f} ms"
-                        )
+                        if speech_end_at is not None:
+                            print(f"  first audio @ {elapsed:.0f} ms -> V2V: {elapsed - speech_end_at:.0f} ms")
                     continue
 
                 data = json.loads(message)
-                if data["type"] in ("speech_start", "speech_end"):
-                    print(f"  {data['type']} @ {elapsed:.0f} ms")
+                if data["type"] == "speech_start":
+                    print(f"  speech_start @ {elapsed:.0f} ms")
+                elif data["type"] == "speech_end":
+                    speech_end_at = elapsed - data["turn_detection_ms"]
+                    print(f"  speech_end @ {elapsed:.0f} ms (turn detection {data['turn_detection_ms']} ms)")
                 elif data["type"] == "transcript":
                     kind = "final" if data["final"] else "interim"
                     print(f"  {kind} transcript @ {elapsed:.0f} ms: {data['text']}")

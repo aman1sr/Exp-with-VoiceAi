@@ -1,3 +1,4 @@
+import time
 from typing import Optional
 
 from pysilero_vad import SileroVoiceActivityDetector
@@ -15,6 +16,7 @@ class VAD:
         self.buffer = b""
         self.speaking = False
         self.silence_ms = 0
+        self.last_speech_at = None
 
     def process(self, frame: bytes) -> Optional[str]:
         self.buffer += frame
@@ -26,6 +28,7 @@ class VAD:
             is_speech = self.model.process_chunk(chunk) > SPEECH_THRESHOLD
             if is_speech:
                 self.silence_ms = 0
+                self.last_speech_at = time.perf_counter()
                 if not self.speaking:
                     self.speaking = True
                     event = "speech_start"
@@ -41,3 +44,4 @@ class VAD:
         self.buffer = b""
         self.speaking = False
         self.silence_ms = 0
+        self.last_speech_at = None
