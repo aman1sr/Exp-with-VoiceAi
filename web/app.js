@@ -1,5 +1,5 @@
-import { startCapture } from "./capture.js?v=p2-2";
-import { Player } from "./playback.js?v=p2-2";
+import { startCapture } from "./capture.js?v=p3-1";
+import { Player } from "./playback.js?v=p3-1";
 
 const $ = (id) => document.getElementById(id);
 
@@ -57,7 +57,7 @@ async function start() {
 
   socket.onerror = () => {
     if (ws === socket && $("talk").disabled) {
-      showStartError("WebSocket connection failed. Check that the P2 server is running, then retry.");
+      showStartError("WebSocket connection failed. Check that the P3 server is running, then retry.");
     }
   };
 
@@ -93,6 +93,10 @@ async function start() {
       sampleRate = msg.sample_rate;
       firstChunk = true;
       player.reset();
+    }
+    else if (msg.type === "transcript") {
+      $("live").textContent = msg.text;
+      $("live").className = msg.final ? "final" : "interim";
     }
     else if (msg.type === "turn_done") addTurn(msg);
     else if (msg.type === "error") $("status").textContent = msg.message;
@@ -135,6 +139,7 @@ const talk = $("talk");
 talk.onpointerdown = () => {
   if (ws?.readyState !== WebSocket.OPEN || talk.disabled) return;
   talking = true;
+  $("live").textContent = "";
   $("status").textContent = "listening...";
   ws.send(JSON.stringify({ type: "start" }));
 };
