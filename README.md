@@ -21,4 +21,4 @@ cp -n .env.example .env      # creates .env only if it doesn't already exist
 uvicorn server.main:app --reload
 ```
 
-Open http://localhost:8000 in Chrome, click **Start** and allow the microphone.
+Open http://localhost:8000 in Chrome, click **Start** and allow the microphone. Speak naturally; server-side VAD detects speech boundaries, so no push-to-talk button is needed.

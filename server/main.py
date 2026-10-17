@@ -6,7 +6,6 @@ from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
-# Load environment variables before importing provider modules.
 from .pipeline import Session  # noqa: E402
 
 app = FastAPI()
@@ -29,10 +28,8 @@ async def ws_endpoint(ws: WebSocket):
         data = json.loads(msg["text"])
         if data["type"] == "ping":
             await ws.send_json({"type": "pong", "t": data["t"]})
-        elif data["type"] == "start":
-            await session.start_listening()
-        elif data["type"] == "end_of_speech":
-            await session.end_of_speech()
+        elif data["type"] == "playback_done":
+            await session.playback_done()
 
 
 # serve the browser client from web/
