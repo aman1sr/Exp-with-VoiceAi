@@ -54,6 +54,7 @@ async def main():
 
     async with websockets.connect(SERVER, max_size=None) as ws:
         start = time.perf_counter()
+        first_audio = None
         await ws.send(json.dumps({"type": "start"}))
         await stream(ws, pcm)
         await ws.send(json.dumps({"type": "end_of_speech"}))
@@ -61,7 +62,9 @@ async def main():
         async for message in ws:
             elapsed = (time.perf_counter() - start) * 1000
             if isinstance(message, bytes):
-                print(f"  first audio @ {elapsed:.0f} ms")
+                if first_audio is None:
+                    first_audio = elapsed
+                    print(f"  first audio @ {first_audio:.0f} ms")
                 continue
 
             data = json.loads(message)

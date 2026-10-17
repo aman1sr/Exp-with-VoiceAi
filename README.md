@@ -16,7 +16,8 @@ and text to speech) and an [OpenRouter](https://openrouter.ai) API key (LLM).
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env        # add DEEPGRAM_API_KEY and OPENROUTER_API_KEY
+cp -n .env.example .env      # creates .env only if it doesn't already exist
+# add DEEPGRAM_API_KEY and OPENROUTER_API_KEY to .env
 uvicorn server.main:app --reload
 ```
 
