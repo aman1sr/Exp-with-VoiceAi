@@ -6,6 +6,7 @@
     python benchmarks/simulate.py "Tell me about the moon." --interrupt "Wait, tell me about Mars instead."
     python benchmarks/simulate.py "Tell me about the moon." --interrupt "Okay."
     python benchmarks/simulate.py "Cancel order 1234." --then "Yes, cancel it."
+    python benchmarks/simulate.py --idle
 
 Run the server first: uvicorn server.main:app
 """
@@ -59,9 +60,10 @@ async def main():
     parser.add_argument("question", nargs="?", default="What is the capital of India?")
     parser.add_argument("--interrupt")
     parser.add_argument("--then", dest="follow_up")
+    parser.add_argument("--idle", action="store_true", help="wait silently for the check-in and goodbye")
     args = parser.parse_args()
 
-    question_pcm = await speech(args.question)
+    question_pcm = await speech(args.question) if not args.idle else b""
     interrupt_pcm = await speech(args.interrupt) if args.interrupt else None
     follow_up_pcm = await speech(args.follow_up) if args.follow_up else None
 
@@ -127,6 +129,9 @@ async def main():
                         greeting_done.set()
                         print(f"  greeting ready @ {elapsed:.0f} ms")
                         continue
+                    if data.get("canned"):
+                        print(f"  canned {data['canned']} @ {elapsed:.0f} ms")
+                        continue
                     turn_number += 1
                     print("  transcript:", data["transcript"])
                     print("  reply:", data["reply"])
@@ -145,6 +150,12 @@ async def main():
         await greeting_done.wait()
         await asyncio.sleep(greeting_audio_bytes / 48000)
         await ws.send(json.dumps({"type": "playback_done"}))
+        if args.idle:
+            try:
+                await asyncio.wait_for(reader, timeout=25)
+            except asyncio.TimeoutError:
+                print("  idle test timed out before the server closed the session")
+            return
         await send_question(question_pcm)
         await first_audio.wait()
 
