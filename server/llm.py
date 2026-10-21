@@ -40,6 +40,33 @@ async def close():
     await client.aclose()
 
 
+async def summarize(messages: list[dict]) -> str:
+    """Compress older conversation turns while preserving useful names and details."""
+    transcript = "\n".join(
+        f"{message['role']}: {message['content']}"
+        for message in messages
+        if message.get("content")
+    )
+    body = {
+        "model": MODEL,
+        "messages": [{
+            "role": "user",
+            "content": "Summarize this conversation in three short sentences, keeping names, numbers, "
+            "order ids and anything the user asked for:\n\n" + transcript,
+        }],
+        "max_tokens": 150,
+    }
+    if PROVIDERS:
+        body["provider"] = {"order": PROVIDERS, "allow_fallbacks": True}
+    response = await client.post(
+        OPENROUTER_URL,
+        headers={"Authorization": f"Bearer {os.environ['OPENROUTER_API_KEY']}"},
+        json=body,
+    )
+    response.raise_for_status()
+    return response.json()["choices"][0]["message"]["content"]
+
+
 async def chat_stream(messages: list[dict], max_tokens: int = 150):
     """Yield text pieces, followed by any complete streamed tool calls."""
     global last_provider

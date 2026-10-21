@@ -8,6 +8,7 @@ import time
 from fastapi import WebSocket
 
 from . import llm, stt, tools, tts
+from .speech_text import clean_for_speech
 from .trace import Trace
 from .vad import VAD
 
@@ -22,9 +23,21 @@ BACKCHANNELS = {
 STOP_WORDS = {"stop", "wait", "pause", "enough", "shh"}
 MS_PER_BYTE = 1 / 48
 MS_PER_WORD = 300
-GREETING = "Hi! I am your voice assistant. What would you like to know?"
 FILLERS = ["Let me check that for you.", "One moment, looking that up.", "Sure, give me a second."]
-greeting_audio = None
+IDLE_SECONDS = 8
+HOLD_SECONDS = 30
+KEEP_TURNS = 6
+CANNED = {
+    "greeting": "Hi! I am your voice assistant. What would you like to know?",
+    "still_there": "Are you still there?",
+    "goodbye": "It seems you have gone. Goodbye!",
+    "take_your_time": "Sure, take your time.",
+}
+HOLD_ON = re.compile(
+    r"\b(hold on|one moment|one second|give me a (second|minute|moment)|just a (second|minute|moment))\b",
+    re.I,
+)
+canned_audio = {}
 
 
 def real_words(text: str) -> set[str]:
@@ -73,8 +86,8 @@ async def chain(first, rest):
 
 
 async def prepare():
-    global greeting_audio
-    greeting_audio = await tts.synthesize(GREETING)
+    for key, text in CANNED.items():
+        canned_audio[key] = await tts.synthesize(text)
 
 
 class Session:
@@ -98,23 +111,45 @@ class Session:
         self.played = None
         self.sentences = []
         self.sentence_ends = []
+        self.idle_task = None
+        self.idle_seconds = IDLE_SECONDS
+        self.prompted = False
+        self.compacting = False
 
     async def start(self):
         """Play a cached greeting while opening connections needed for the first turn."""
-        if greeting_audio is None:
+        if not canned_audio:
             await prepare()
-        self.state = "agent_turn"
-        self.sentences = [GREETING]
-        self.sentence_ends = [len(greeting_audio) * MS_PER_BYTE]
-        self.messages.append({"role": "assistant", "content": GREETING})
-        await self.ws.send_json({"type": "audio_start", "sample_rate": tts.SAMPLE_RATE})
-        await self.ws.send_bytes(greeting_audio)
-        await self.ws.send_json({"type": "turn_done", "greeting": True})
+        await self.say_canned("greeting")
 
         self.stt_ws = await stt.connect()
         self.reader = asyncio.create_task(self.read_events())
         self.next_tts = asyncio.create_task(tts.connect())
         asyncio.create_task(llm.warm_up())
+
+    async def say_canned(self, key: str):
+        """Play a pre-rendered line as an agent turn without waiting on TTS."""
+        text, audio = CANNED[key], canned_audio[key]
+        self.state = "agent_turn"
+        self.turn = None
+        self.paused, self.heard = False, set()
+        self.sentences, self.sentence_ends = [text], [len(audio) * MS_PER_BYTE]
+        self.messages.append({"role": "assistant", "content": text})
+        await self.ws.send_json({"type": "audio_start", "sample_rate": tts.SAMPLE_RATE})
+        await self.ws.send_bytes(audio)
+        await self.ws.send_json({"type": "turn_done", "greeting": key == "greeting", "canned": key})
+
+    async def idle_watch(self):
+        """Check in after silence, then end a session that remains inactive."""
+        await asyncio.sleep(self.idle_seconds)
+        self.idle_task = None
+        if self.prompted:
+            await self.say_canned("goodbye")
+            await asyncio.sleep(len(canned_audio["goodbye"]) * MS_PER_BYTE / 1000)
+            await self.ws.close()
+        else:
+            self.prompted = True
+            await self.say_canned("still_there")
 
     async def tts_connection(self):
         tts_ws = await self.next_tts
@@ -148,6 +183,9 @@ class Session:
 
             if self.state == "listening" and event == "StartOfTurn":
                 self.state = "user_speaking"
+                if self.idle_task:
+                    self.idle_task.cancel()
+                    self.idle_task = None
                 await self.ws.send_json({"type": "speech_start"})
 
             if self.state == "agent_turn" and transcript:
@@ -171,6 +209,7 @@ class Session:
                 if (self.over_agent and not real) or (real and real <= STOP_WORDS):
                     self.drop_speculation()
                     self.state = "listening"
+                    self.idle_task = asyncio.create_task(self.idle_watch())
                     continue
                 await self.end_of_turn(transcript)
 
@@ -241,12 +280,54 @@ class Session:
         self.vad.reset()
         self.paused, self.heard = False, set()
         await self.ws.send_json({"type": "speech_end", "turn_detection_ms": turn_detection_ms})
+        self.prompted = False
+        self.idle_seconds = IDLE_SECONDS
+
+        last_reply = (self.messages[-1].get("content") or "") if self.messages else ""
+        if len(transcript.split()) >= 4 and transcript.lower().rstrip(".?!") in last_reply.lower():
+            self.state = "listening"
+            self.idle_task = asyncio.create_task(self.idle_watch())
+            return
+        if HOLD_ON.search(transcript):
+            self.idle_seconds = HOLD_SECONDS
+            self.messages.append({"role": "user", "content": transcript})
+            await self.say_canned("take_your_time")
+            return
         self.turn = asyncio.create_task(self.run_turn(transcript, turn_detection_ms))
 
     async def playback_done(self):
         """Return to listening, unless Flux has already detected the next user turn."""
         self.vad.reset()
         self.state = "user_speaking" if self.user_talking else "listening"
+        if self.state == "listening":
+            self.idle_task = asyncio.create_task(self.idle_watch())
+        if not self.compacting:
+            asyncio.create_task(self.compact_history())
+
+    async def compact_history(self):
+        """Summarize older user turns to keep long conversations within the context window."""
+        user_turns = [index for index, message in enumerate(self.messages) if message["role"] == "user"]
+        if len(user_turns) <= KEEP_TURNS:
+            return
+        self.compacting = True
+        cut = user_turns[-KEEP_TURNS]
+        history = list(self.messages)
+        boundary = history[cut]
+        try:
+            summary = await llm.summarize(history[:cut])
+            current_cut = next(
+                (index for index, message in enumerate(self.messages) if message is boundary),
+                None,
+            )
+            if current_cut is not None:
+                self.messages = [
+                    {"role": "system", "content": "Earlier in this conversation: " + summary},
+                    *self.messages[current_cut:],
+                ]
+        except Exception:
+            log.exception("conversation history summarization failed")
+        finally:
+            self.compacting = False
 
     async def run_turn(self, transcript: str, turn_detection_ms: int):
         """Run streamed LLM/TTS, executing requested tools between model rounds."""
@@ -263,6 +344,7 @@ class Session:
         if not speculated:
             stream = llm.chat_stream(self.messages)
         tool_ms = 0
+        written = []
 
         try:
             tts_ws = await self.tts_connection()
@@ -276,6 +358,12 @@ class Session:
                         continue
                     if "llm_first_sentence" not in trace.marks:
                         trace.mark("llm_first_sentence")
+                    spoken = clean_for_speech(item)
+                    if spoken != item:
+                        written.append(item)
+                    item = spoken
+                    if not item:
+                        continue
                     self.sentences.append(item)
                     text += item + " "
                     await tts.speak(tts_ws, item)
@@ -347,6 +435,7 @@ class Session:
             "provider": llm.last_provider,
             "speculated": speculated,
             "tool_ms": tool_ms,
+            "written": " ".join(written),
             "timings": {
                 "turn_detection": turn_detection_ms,
                 "stt": trace.marks["stt_done"],

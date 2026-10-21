@@ -131,7 +131,7 @@ async function start() {
       $("live").textContent = msg.text;
       $("live").className = msg.final ? "final" : "interim";
     } else if (msg.type === "turn_done") {
-      if (!msg.greeting) addTurn(msg);
+      if (!msg.greeting && msg.transcript) addTurn(msg);
       turnDone = true;
       if (!player.paused) armPlaybackDone(socket);
     } else if (msg.type === "error") {
@@ -146,8 +146,9 @@ function showStartError(message) {
   $("start").disabled = false;
 }
 
-function addTurn({ transcript, reply, provider, speculated, tool_ms, timings: t }) {
+function addTurn({ transcript, reply, written, provider, speculated, tool_ms, timings: t }) {
   if (provider) reply += " (" + provider + ")";
+  if (written) reply += " (model wrote: " + written + ")";
   if (speculated) reply += " [LLM started early]";
   if (tool_ms) reply += " [tool call: " + tool_ms + " ms]";
   const v2v = $("v2v").textContent;
