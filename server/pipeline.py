@@ -18,6 +18,8 @@ BACKCHANNELS = {
 STOP_WORDS = {"stop", "wait", "pause", "enough", "shh"}
 MS_PER_BYTE = 1 / 48
 MS_PER_WORD = 300
+GREETING = "Hi! I am your voice assistant. What would you like to know?"
+greeting_audio = None
 
 
 def real_words(text: str) -> set[str]:
@@ -53,6 +55,20 @@ async def forward_audio(tts_ws, ws: WebSocket, trace: Trace, sentence_ends: list
     trace.mark("audio_sent")
 
 
+async def chain(first, rest):
+    try:
+        yield await first
+    except StopAsyncIteration:
+        return
+    async for piece in rest:
+        yield piece
+
+
+async def prepare():
+    global greeting_audio
+    greeting_audio = await tts.synthesize(GREETING)
+
+
 class Session:
     """One browser connection with continuous STT and barge-in handling."""
 
@@ -65,6 +81,8 @@ class Session:
         self.chunk = b""
         self.reader = None
         self.turn = None
+        self.next_tts = None
+        self.speculation = None
         self.paused = False
         self.user_talking = False
         self.over_agent = False
@@ -74,9 +92,28 @@ class Session:
         self.sentence_ends = []
 
     async def start(self):
-        """Open the continuous STT connection for this browser session."""
+        """Play a cached greeting while opening connections needed for the first turn."""
+        if greeting_audio is None:
+            await prepare()
+        self.state = "agent_turn"
+        self.sentences = [GREETING]
+        self.sentence_ends = [len(greeting_audio) * MS_PER_BYTE]
+        self.messages.append({"role": "assistant", "content": GREETING})
+        await self.ws.send_json({"type": "audio_start", "sample_rate": tts.SAMPLE_RATE})
+        await self.ws.send_bytes(greeting_audio)
+        await self.ws.send_json({"type": "turn_done", "greeting": True})
+
         self.stt_ws = await stt.connect()
         self.reader = asyncio.create_task(self.read_events())
+        self.next_tts = asyncio.create_task(tts.connect())
+        asyncio.create_task(llm.warm_up())
+
+    async def tts_connection(self):
+        tts_ws = await self.next_tts
+        self.next_tts = asyncio.create_task(tts.connect())
+        if tts_ws.close_code is not None:
+            tts_ws = await tts.connect()
+        return tts_ws
 
     async def on_audio(self, frame: bytes):
         """Forward every microphone frame and pause playback while checking for an interruption."""
@@ -97,9 +134,7 @@ class Session:
         """Use Flux turn events to update the session and publish live text."""
         async for event, transcript in stt.events(self.stt_ws):
             if event == "StartOfTurn":
-                self.user_talking = True
-                self.over_agent = self.state == "agent_turn"
-                self.heard = set()
+                self.user_talking, self.over_agent, self.heard = True, self.state == "agent_turn", set()
             elif event == "EndOfTurn":
                 self.user_talking = False
 
@@ -108,8 +143,8 @@ class Session:
                 await self.ws.send_json({"type": "speech_start"})
 
             if self.state == "agent_turn" and transcript:
-                self.heard = real_words(transcript)
-                if len(self.heard) >= 2 or (self.heard and event == "EndOfTurn"):
+                real = self.heard = real_words(transcript)
+                if len(real) >= 2 or (real and event == "EndOfTurn"):
                     await self.interrupt()
                 elif event == "EndOfTurn":
                     await self.resume()
@@ -119,12 +154,36 @@ class Session:
 
             final = event == "EndOfTurn"
             await self.ws.send_json({"type": "transcript", "text": transcript, "final": final})
-            if final and transcript:
-                spoken_words = real_words(transcript)
-                if (self.over_agent and not spoken_words) or (spoken_words and spoken_words <= STOP_WORDS):
+            if event == "EagerEndOfTurn" and transcript:
+                self.speculate(transcript)
+            elif event == "TurnResumed":
+                self.drop_speculation()
+            elif final and transcript:
+                real = real_words(transcript)
+                if (self.over_agent and not real) or (real and real <= STOP_WORDS):
+                    self.drop_speculation()
                     self.state = "listening"
                     continue
                 await self.end_of_turn(transcript)
+
+    def speculate(self, transcript: str):
+        self.drop_speculation()
+        stream = llm.chat_stream([*self.messages, {"role": "user", "content": transcript}])
+        first = asyncio.create_task(stream.__anext__())
+        self.speculation = (transcript, stream, first)
+
+    def drop_speculation(self):
+        if self.speculation:
+            self.speculation[2].cancel()
+            self.speculation = None
+
+    def take_speculation(self, transcript: str):
+        if not self.speculation or self.speculation[0] != transcript:
+            self.drop_speculation()
+            return None
+        _, stream, first = self.speculation
+        self.speculation = None
+        return chain(first, stream)
 
     async def resume(self):
         if self.paused:
@@ -172,8 +231,7 @@ class Session:
         last_speech_at = self.vad.last_speech_at
         turn_detection_ms = round((time.perf_counter() - last_speech_at) * 1000) if last_speech_at else 0
         self.vad.reset()
-        self.paused = False
-        self.heard = set()
+        self.paused, self.heard = False, set()
         await self.ws.send_json({"type": "speech_end", "turn_detection_ms": turn_detection_ms})
         self.turn = asyncio.create_task(self.run_turn(transcript, turn_detection_ms))
 
@@ -190,11 +248,17 @@ class Session:
         await self.ws.send_json({"type": "audio_start", "sample_rate": tts.SAMPLE_RATE})
         self.sentences = []
         self.sentence_ends = []
-        tts_ws = await tts.connect()
-        forward = asyncio.create_task(forward_audio(tts_ws, self.ws, trace, self.sentence_ends))
+        tts_ws = None
+        forward = None
+        stream = self.take_speculation(transcript)
+        speculated = stream is not None
 
         try:
-            async for sentence in sentences(llm.chat_stream(self.messages), trace):
+            tts_ws = await self.tts_connection()
+            forward = asyncio.create_task(forward_audio(tts_ws, self.ws, trace, self.sentence_ends))
+            if not speculated:
+                stream = llm.chat_stream(self.messages)
+            async for sentence in sentences(stream, trace):
                 if not self.sentences:
                     trace.mark("llm_first_sentence")
                 self.sentences.append(sentence)
@@ -204,22 +268,28 @@ class Session:
             await tts.close(tts_ws)
             await forward
         except asyncio.CancelledError:
-            forward.cancel()
-            try:
-                await forward
-            except asyncio.CancelledError:
-                pass
-            await tts_ws.close()
+            if forward is not None:
+                forward.cancel()
+                try:
+                    await forward
+                except asyncio.CancelledError:
+                    pass
+            if tts_ws is not None:
+                await tts_ws.close()
             return
 
         reply = " ".join(self.sentences)
         self.messages.append({"role": "assistant", "content": reply})
+        trace.marks["turn_detection"] = turn_detection_ms
+        trace.marks["first_audio"] = turn_detection_ms + trace.marks["tts_first_byte"]
         trace.save()
 
         await self.ws.send_json({
             "type": "turn_done",
             "transcript": transcript,
             "reply": reply,
+            "provider": llm.last_provider,
+            "speculated": speculated,
             "timings": {
                 "turn_detection": turn_detection_ms,
                 "stt": trace.marks["stt_done"],

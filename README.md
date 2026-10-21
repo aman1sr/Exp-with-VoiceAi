@@ -21,4 +21,6 @@ cp -n .env.example .env      # creates .env only if it doesn't already exist
 uvicorn server.main:app --reload
 ```
 
-Open http://localhost:8000 in Chrome, click **Start** and allow the microphone. Flux detects turns; if you speak over the agent, the browser pauses playback while Flux decides whether to interrupt or resume.
+Open http://localhost:8000 in Chrome, click **Start** and allow the microphone. P7 pre-renders a greeting and warms provider connections; Flux starts the LLM speculatively at EagerEndOfTurn and discards that request if speech resumes. The browser still pauses playback while Flux decides whether to interrupt or resume.
+
+Optional `LLM_MODEL` and `LLM_PROVIDERS` settings select an OpenRouter model and inference provider. Compare first-token latency with `python benchmarks/llm_shootout.py`; summarize run traces with `python benchmarks/analyze.py`.
