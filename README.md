@@ -21,4 +21,4 @@ cp -n .env.example .env      # creates .env only if it doesn't already exist
 uvicorn server.main:app --reload
 ```
 
-Open http://localhost:8000 in Chrome, click **Start** and allow the microphone. Flux listens continuously and uses speech context to determine when your turn ends; Silero VAD remains for speech timing.
+Open http://localhost:8000 in Chrome, click **Start** and allow the microphone. Flux detects turns; if you speak over the agent, the browser pauses playback while Flux decides whether to interrupt or resume.

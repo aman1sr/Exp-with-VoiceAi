@@ -1,5 +1,5 @@
-import { startCapture } from "./capture.js?v=p5-1";
-import { Player } from "./playback.js?v=p5-1";
+import { startCapture } from "./capture.js?v=p6-1";
+import { Player } from "./playback.js?v=p6-1";
 
 const $ = (id) => document.getElementById(id);
 
@@ -12,6 +12,18 @@ let firstChunk = true;
 let turn = 0;
 let startupComplete = false;
 let playbackTimer = null;
+let turnDone = false;
+
+function armPlaybackDone(socket) {
+  if (playbackTimer !== null) clearTimeout(playbackTimer);
+  playbackTimer = setTimeout(() => {
+    if (socket.readyState === WebSocket.OPEN) {
+      socket.send(JSON.stringify({ type: "playback_done" }));
+      $("status").textContent = "listening";
+    }
+    playbackTimer = null;
+  }, player.remainingMs());
+}
 
 async function start() {
   let socket;
@@ -56,7 +68,7 @@ async function start() {
 
   socket.onerror = () => {
     if (ws === socket && !startupComplete) {
-      showStartError("WebSocket connection failed. Check that the P5 server is running, then retry.");
+      showStartError("WebSocket connection failed. Check that the P6 server is running, then retry.");
     }
   };
 
@@ -97,25 +109,32 @@ async function start() {
     } else if (msg.type === "audio_start") {
       sampleRate = msg.sample_rate;
       firstChunk = true;
+      turnDone = false;
       player.reset();
       $("status").textContent = "speaking...";
-    }
-    else if (msg.type === "transcript") {
+    } else if (msg.type === "pause_audio") {
+      player.pause().catch((error) => console.error("Audio pause failed", error));
+      if (playbackTimer !== null) clearTimeout(playbackTimer);
+      playbackTimer = null;
+      $("status").textContent = `paused while listening (${msg.after_ms} ms)`;
+    } else if (msg.type === "resume_audio") {
+      player.resume().catch((error) => console.error("Audio resume failed", error));
+      if (turnDone) armPlaybackDone(socket);
+      $("status").textContent = "speaking...";
+    } else if (msg.type === "clear_audio") {
+      const playedMs = player.clear();
+      if (playbackTimer !== null) clearTimeout(playbackTimer);
+      playbackTimer = null;
+      socket.send(JSON.stringify({ type: "played", ms: playedMs }));
+      $("status").textContent = `interrupted after ${Math.round(playedMs)} ms`;
+    } else if (msg.type === "transcript") {
       $("live").textContent = msg.text;
       $("live").className = msg.final ? "final" : "interim";
-    }
-    else if (msg.type === "turn_done") {
+    } else if (msg.type === "turn_done") {
       addTurn(msg);
-      if (playbackTimer !== null) clearTimeout(playbackTimer);
-      playbackTimer = setTimeout(() => {
-        if (socket.readyState === WebSocket.OPEN) {
-          socket.send(JSON.stringify({ type: "playback_done" }));
-          $("status").textContent = "listening";
-        }
-        playbackTimer = null;
-      }, player.remainingMs());
-    }
-    else if (msg.type === "error") {
+      turnDone = true;
+      if (!player.paused) armPlaybackDone(socket);
+    } else if (msg.type === "error") {
       $("status").textContent = msg.message;
       if (socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify({ type: "playback_done" }));
     }
@@ -134,7 +153,7 @@ function addTurn({ transcript, reply, timings: t }) {
   const expectedTimings = ["turn_detection", "stt", "llm_first_token", "llm_first_sentence", "tts_first_byte", "first_audio", "total"];
   const missingTimings = expectedTimings.filter((name) => !Number.isFinite(t?.[name]));
   if (missingTimings.length) {
-    console.warn("P5 timing fields missing from turn_done:", missingTimings, t);
+    console.warn("P6 timing fields missing from turn_done:", missingTimings, t);
   }
   $("turns").insertAdjacentHTML("afterbegin", `
     <tr>

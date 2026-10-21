@@ -1,13 +1,16 @@
-"""Simulate a spoken turn without a microphone.
+"""Simulate speech, interruptions, and follow-up turns without a microphone.
 
     python benchmarks/simulate.py "What is the capital of India?"
+    python benchmarks/simulate.py "Tell me about the moon." --interrupt "Wait, tell me about Mars instead."
+    python benchmarks/simulate.py "Tell me about the moon." --interrupt "Okay."
+    python benchmarks/simulate.py "Cancel order 1234." --then "Yes, cancel it."
 
 Run the server first: uvicorn server.main:app
 """
+import argparse
 import asyncio
 import json
 import os
-import sys
 import time
 
 import httpx
@@ -16,7 +19,6 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-QUESTION = next((arg for arg in sys.argv[1:] if not arg.startswith("--")), "What is the capital of India?")
 SERVER = "ws://127.0.0.1:8000/ws"
 
 
@@ -51,48 +53,115 @@ async def stream(ws, pcm):
 
 
 async def main():
-    pcm = await speech(QUESTION)
-    audio = silence(600) + pcm + silence(2500)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("question", nargs="?", default="What is the capital of India?")
+    parser.add_argument("--interrupt")
+    parser.add_argument("--then", dest="follow_up")
+    args = parser.parse_args()
+
+    question_pcm = await speech(args.question)
+    interrupt_pcm = await speech(args.interrupt) if args.interrupt else None
+    follow_up_pcm = await speech(args.follow_up) if args.follow_up else None
 
     async with websockets.connect(SERVER, max_size=None) as ws:
-        start = time.perf_counter()
-        first_audio = None
-        speech_end_at = None
+        started_at = time.perf_counter()
+        turns = asyncio.Queue()
+        first_audio = asyncio.Event()
+        interruption_cleared = asyncio.Event()
+        reply_audio_started_at = None
+        pause_started_at = None
+        turn_number = 0
+        cleared_after_turn = 0
+
+        def elapsed_ms():
+            return (time.perf_counter() - started_at) * 1000
 
         async def read_events():
-            nonlocal first_audio, speech_end_at
+            nonlocal reply_audio_started_at, pause_started_at, turn_number, cleared_after_turn
             async for message in ws:
-                elapsed = (time.perf_counter() - start) * 1000
+                elapsed = elapsed_ms()
                 if isinstance(message, bytes):
-                    if first_audio is None:
-                        first_audio = elapsed
-                        if speech_end_at is not None:
-                            print(f"  first audio @ {elapsed:.0f} ms -> V2V: {elapsed - speech_end_at:.0f} ms")
+                    if reply_audio_started_at is None:
+                        reply_audio_started_at = time.perf_counter()
+                        first_audio.set()
+                        print(f"  first audio @ {elapsed:.0f} ms")
                     continue
 
                 data = json.loads(message)
-                if data["type"] == "speech_start":
+                kind = data["type"]
+                if kind == "speech_start":
                     print(f"  speech_start @ {elapsed:.0f} ms")
-                elif data["type"] == "speech_end":
-                    speech_end_at = elapsed - data["turn_detection_ms"]
+                elif kind == "speech_end":
                     print(f"  speech_end @ {elapsed:.0f} ms (turn detection {data['turn_detection_ms']} ms)")
-                elif data["type"] == "transcript":
-                    kind = "final" if data["final"] else "interim"
-                    print(f"  {kind} transcript @ {elapsed:.0f} ms: {data['text']}")
-                elif data["type"] == "audio_start":
+                elif kind == "transcript":
+                    label = "final" if data["final"] else "interim"
+                    print(f"  {label} transcript @ {elapsed:.0f} ms: {data['text']}")
+                elif kind == "audio_start":
+                    reply_audio_started_at = None
+                    first_audio.clear()
                     print(f"  audio sample rate: {data['sample_rate']} Hz")
-                elif data["type"] == "turn_done":
+                elif kind == "pause_audio":
+                    pause_started_at = time.perf_counter()
+                    print(f"  pause_audio @ {elapsed:.0f} ms")
+                elif kind == "resume_audio":
+                    pause_started_at = None
+                    print(f"  resume_audio @ {elapsed:.0f} ms")
+                elif kind == "clear_audio":
+                    played_ms = max(0, ((pause_started_at or time.perf_counter()) - reply_audio_started_at) * 1000) if reply_audio_started_at else 0
+                    await ws.send(json.dumps({"type": "played", "ms": played_ms}))
+                    cleared_after_turn = turn_number
+                    interruption_cleared.set()
+                    print(f"  clear_audio @ {elapsed:.0f} ms, heard about {played_ms:.0f} ms")
+                elif kind == "turn_done":
+                    turn_number += 1
                     print("  transcript:", data["transcript"])
                     print("  reply:", data["reply"])
                     print("  timings:", data["timings"])
-                    return
-                elif data["type"] == "error":
+                    await turns.put((turn_number, data))
+                elif kind == "error":
                     print("  error:", data["message"])
-                    return
 
         reader = asyncio.create_task(read_events())
-        await stream(ws, audio)
-        await reader
+
+        async def send_question(pcm):
+            await stream(ws, silence(600) + pcm + silence(2500))
+
+        await send_question(question_pcm)
+        await first_audio.wait()
+
+        if interrupt_pcm is not None:
+            await asyncio.sleep(0.8)
+            print(f"  interrupting @ {elapsed_ms():.0f} ms: {args.interrupt}")
+            await send_question(interrupt_pcm)
+            try:
+                await asyncio.wait_for(interruption_cleared.wait(), timeout=8)
+            except asyncio.TimeoutError:
+                print("  no interruption confirmed; agent likely treated it as a backchannel")
+            if interruption_cleared.is_set():
+                first_turn = cleared_after_turn
+                while True:
+                    next_turn, _ = await turns.get()
+                    if next_turn > first_turn:
+                        break
+            else:
+                first_turn, _ = await turns.get()
+        else:
+            first_turn, _ = await turns.get()
+        if args.follow_up:
+            await asyncio.sleep(2)
+            await ws.send(json.dumps({"type": "playback_done"}))
+            print(f"  follow-up @ {elapsed_ms():.0f} ms: {args.follow_up}")
+            await send_question(follow_up_pcm)
+            while True:
+                next_turn, _ = await turns.get()
+                if next_turn > first_turn:
+                    break
+
+        reader.cancel()
+        try:
+            await reader
+        except asyncio.CancelledError:
+            pass
 
 
 asyncio.run(main())
