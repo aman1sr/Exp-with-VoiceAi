@@ -1,6 +1,7 @@
 import json
 import os
 
+import httpx
 import websockets
 
 DEEPGRAM_URL = "wss://api.deepgram.com/v1/speak"
@@ -37,3 +38,22 @@ async def messages(tts_ws):
             data = json.loads(message)
             if data["type"] == "Flushed":
                 yield "flushed", data["sequence_id"]
+
+
+async def synthesize(text: str) -> bytes:
+    params = {
+        "model": "aura-2-thalia-en",
+        "encoding": "linear16",
+        "sample_rate": SAMPLE_RATE,
+        "container": "none",
+    }
+    headers = {"Authorization": f"Token {os.environ['DEEPGRAM_API_KEY']}"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        response = await client.post(
+            "https://api.deepgram.com/v1/speak",
+            params=params,
+            headers=headers,
+            json={"text": text},
+        )
+        response.raise_for_status()
+    return response.content

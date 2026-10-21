@@ -1,5 +1,5 @@
-import { startCapture } from "./capture.js?v=p6-1";
-import { Player } from "./playback.js?v=p6-1";
+import { startCapture } from "./capture.js?v=p7-1";
+import { Player } from "./playback.js?v=p7-1";
 
 const $ = (id) => document.getElementById(id);
 
@@ -68,7 +68,7 @@ async function start() {
 
   socket.onerror = () => {
     if (ws === socket && !startupComplete) {
-      showStartError("WebSocket connection failed. Check that the P6 server is running, then retry.");
+      showStartError("WebSocket connection failed. Check that the P7 server is running, then retry.");
     }
   };
 
@@ -131,7 +131,7 @@ async function start() {
       $("live").textContent = msg.text;
       $("live").className = msg.final ? "final" : "interim";
     } else if (msg.type === "turn_done") {
-      addTurn(msg);
+      if (!msg.greeting) addTurn(msg);
       turnDone = true;
       if (!player.paused) armPlaybackDone(socket);
     } else if (msg.type === "error") {
@@ -146,14 +146,16 @@ function showStartError(message) {
   $("start").disabled = false;
 }
 
-function addTurn({ transcript, reply, timings: t }) {
+function addTurn({ transcript, reply, provider, speculated, timings: t }) {
+  if (provider) reply += " (" + provider + ")";
+  if (speculated) reply += " [LLM started early]";
   const v2v = $("v2v").textContent;
   const timing = (name) => Number.isFinite(t?.[name]) ? t[name] : "—";
   const bar = (name, ms) => `<span class="${name}" style="width:${Number.isFinite(ms) ? ms / 10 : 0}px"></span>`;
   const expectedTimings = ["turn_detection", "stt", "llm_first_token", "llm_first_sentence", "tts_first_byte", "first_audio", "total"];
   const missingTimings = expectedTimings.filter((name) => !Number.isFinite(t?.[name]));
   if (missingTimings.length) {
-    console.warn("P6 timing fields missing from turn_done:", missingTimings, t);
+    console.warn("P7 timing fields missing from turn_done:", missingTimings, t);
   }
   $("turns").insertAdjacentHTML("afterbegin", `
     <tr>

@@ -66,8 +66,11 @@ async def main():
     async with websockets.connect(SERVER, max_size=None) as ws:
         started_at = time.perf_counter()
         turns = asyncio.Queue()
+        greeting_done = asyncio.Event()
         first_audio = asyncio.Event()
         interruption_cleared = asyncio.Event()
+        greeting_audio_bytes = 0
+        greeting_finished = False
         reply_audio_started_at = None
         pause_started_at = None
         turn_number = 0
@@ -77,10 +80,14 @@ async def main():
             return (time.perf_counter() - started_at) * 1000
 
         async def read_events():
-            nonlocal reply_audio_started_at, pause_started_at, turn_number, cleared_after_turn
+            nonlocal greeting_audio_bytes, greeting_finished, reply_audio_started_at
+            nonlocal pause_started_at, turn_number, cleared_after_turn
             async for message in ws:
                 elapsed = elapsed_ms()
                 if isinstance(message, bytes):
+                    if not greeting_finished:
+                        greeting_audio_bytes += len(message)
+                        continue
                     if reply_audio_started_at is None:
                         reply_audio_started_at = time.perf_counter()
                         first_audio.set()
@@ -113,6 +120,11 @@ async def main():
                     interruption_cleared.set()
                     print(f"  clear_audio @ {elapsed:.0f} ms, heard about {played_ms:.0f} ms")
                 elif kind == "turn_done":
+                    if data.get("greeting"):
+                        greeting_finished = True
+                        greeting_done.set()
+                        print(f"  greeting ready @ {elapsed:.0f} ms")
+                        continue
                     turn_number += 1
                     print("  transcript:", data["transcript"])
                     print("  reply:", data["reply"])
@@ -126,6 +138,9 @@ async def main():
         async def send_question(pcm):
             await stream(ws, silence(600) + pcm + silence(2500))
 
+        await greeting_done.wait()
+        await asyncio.sleep(greeting_audio_bytes / 48000)
+        await ws.send(json.dumps({"type": "playback_done"}))
         await send_question(question_pcm)
         await first_audio.wait()
 

@@ -1,4 +1,5 @@
 import json
+from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket
@@ -6,9 +7,20 @@ from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 
+from . import llm, pipeline  # noqa: E402
 from .pipeline import Session  # noqa: E402
 
-app = FastAPI()
+
+@asynccontextmanager
+async def lifespan(app):
+    await pipeline.prepare()
+    try:
+        yield
+    finally:
+        await llm.close()
+
+
+app = FastAPI(lifespan=lifespan)
 
 
 @app.websocket("/ws")
