@@ -17,6 +17,7 @@ class VAD:
         self.speaking = False
         self.silence_ms = 0
         self.last_speech_at = None
+        self.speech_ms = 0
 
     def process(self, frame: bytes) -> Optional[str]:
         self.buffer += frame
@@ -28,9 +29,11 @@ class VAD:
             is_speech = self.model.process_chunk(chunk) > SPEECH_THRESHOLD
             if is_speech:
                 self.silence_ms = 0
+                self.speech_ms += CHUNK_MS
                 self.last_speech_at = time.perf_counter()
                 if not self.speaking:
                     self.speaking = True
+                    self.speech_ms = CHUNK_MS
                     event = "speech_start"
             elif self.speaking:
                 self.silence_ms += CHUNK_MS
@@ -45,3 +48,4 @@ class VAD:
         self.speaking = False
         self.silence_ms = 0
         self.last_speech_at = None
+        self.speech_ms = 0

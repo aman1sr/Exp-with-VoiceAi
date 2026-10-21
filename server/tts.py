@@ -28,8 +28,12 @@ async def close(tts_ws):
     await tts_ws.send(json.dumps({"type": "Close"}))
 
 
-async def audio_chunks(tts_ws):
-    """Yield audio bytes as they arrive. JSON status messages are skipped."""
+async def messages(tts_ws):
+    """Yield audio chunks and sentence-flush markers from Deepgram."""
     async for message in tts_ws:
         if isinstance(message, bytes):
-            yield message
+            yield "audio", message
+        else:
+            data = json.loads(message)
+            if data["type"] == "Flushed":
+                yield "flushed", data["sequence_id"]

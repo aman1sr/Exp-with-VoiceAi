@@ -1,19 +1,42 @@
-// Plays raw PCM16 audio chunks back to back, with no gaps, through Web Audio.
+// Plays raw PCM16 audio chunks back to back, with pause and interruption support.
 
 export class Player {
   constructor() {
     this.ctx = new AudioContext();
     this.nextTime = 0;
+    this.startTime = 0;
+    this.sources = [];
     this.pendingByte = null;
+    this.paused = false;
   }
 
   reset() {
     this.nextTime = 0;
+    this.startTime = 0;
+    this.sources = [];
     this.pendingByte = null;
+    this.resume();
+  }
+
+  pause() {
+    this.paused = true;
+    return this.ctx.suspend();
+  }
+
+  resume() {
+    this.paused = false;
+    return this.ctx.resume();
+  }
+
+  clear() {
+    const playedMs = this.sources.length ? (this.ctx.currentTime - this.startTime) * 1000 : 0;
+    this.sources.forEach((source) => source.stop());
+    this.reset();
+    return Math.max(0, playedMs);
   }
 
   remainingMs() {
-    return Math.max(0, (this.nextTime - this.ctx.currentTime) * 1000);
+    return Math.max(0, this.nextTime - this.ctx.currentTime) * 1000;
   }
 
   enqueue(arrayBuffer, sampleRate) {
@@ -42,6 +65,8 @@ export class Player {
     source.connect(this.ctx.destination);
     const startAt = Math.max(this.ctx.currentTime, this.nextTime);
     source.start(startAt);
+    if (this.sources.length === 0) this.startTime = startAt;
+    this.sources.push(source);
     this.nextTime = startAt + buffer.duration;
     return performance.now() + (startAt - this.ctx.currentTime) * 1000;
   }
