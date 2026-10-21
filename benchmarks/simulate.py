@@ -1,6 +1,8 @@
 """Simulate speech, interruptions, and follow-up turns without a microphone.
 
     python benchmarks/simulate.py "What is the capital of India?"
+    python benchmarks/simulate.py "What is the weather in Paris?"
+    python benchmarks/simulate.py "What is the status of order 1234?"
     python benchmarks/simulate.py "Tell me about the moon." --interrupt "Wait, tell me about Mars instead."
     python benchmarks/simulate.py "Tell me about the moon." --interrupt "Okay."
     python benchmarks/simulate.py "Cancel order 1234." --then "Yes, cancel it."
@@ -128,6 +130,8 @@ async def main():
                     turn_number += 1
                     print("  transcript:", data["transcript"])
                     print("  reply:", data["reply"])
+                    if data.get("tool_ms") is not None:
+                        print("  tool time:", data["tool_ms"], "ms")
                     print("  timings:", data["timings"])
                     await turns.put((turn_number, data))
                 elif kind == "error":

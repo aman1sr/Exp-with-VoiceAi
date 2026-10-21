@@ -1,14 +1,18 @@
 import asyncio
+import json
+import logging
+import random
 import re
 import time
 
 from fastapi import WebSocket
 
-from . import llm, stt, tts
+from . import llm, stt, tools, tts
 from .trace import Trace
 from .vad import VAD
 
 SENTENCE_END = re.compile(r"[.!?]\s")
+log = logging.getLogger("uvicorn.error")
 BARGE_IN_MIN_MS = 300
 BACKCHANNELS = {
     "okay", "ok", "yeah", "yes", "yep", "right", "sure", "alright", "hmm", "hm", "hum", "mhm",
@@ -19,6 +23,7 @@ STOP_WORDS = {"stop", "wait", "pause", "enough", "shh"}
 MS_PER_BYTE = 1 / 48
 MS_PER_WORD = 300
 GREETING = "Hi! I am your voice assistant. What would you like to know?"
+FILLERS = ["Let me check that for you.", "One moment, looking that up.", "Sure, give me a second."]
 greeting_audio = None
 
 
@@ -33,6 +38,9 @@ async def sentences(text_stream, trace: Trace):
     async for piece in text_stream:
         if "llm_first_token" not in trace.marks:
             trace.mark("llm_first_token")
+        if not isinstance(piece, str):
+            yield piece
+            continue
         buffer += piece
         while match := SENTENCE_END.search(buffer):
             yield buffer[: match.end()].strip()
@@ -241,7 +249,7 @@ class Session:
         self.state = "user_speaking" if self.user_talking else "listening"
 
     async def run_turn(self, transcript: str, turn_detection_ms: int):
-        """Run the existing streamed LLM/TTS response pipeline for a completed turn."""
+        """Run streamed LLM/TTS, executing requested tools between model rounds."""
         trace = Trace()
         trace.mark("stt_done")
         self.messages.append({"role": "user", "content": transcript})
@@ -252,17 +260,53 @@ class Session:
         forward = None
         stream = self.take_speculation(transcript)
         speculated = stream is not None
+        if not speculated:
+            stream = llm.chat_stream(self.messages)
+        tool_ms = 0
 
         try:
             tts_ws = await self.tts_connection()
             forward = asyncio.create_task(forward_audio(tts_ws, self.ws, trace, self.sentence_ends))
-            if not speculated:
-                stream = llm.chat_stream(self.messages)
-            async for sentence in sentences(stream, trace):
-                if not self.sentences:
+            while True:
+                calls = []
+                text = ""
+                async for item in sentences(stream, trace):
+                    if isinstance(item, llm.ToolCall):
+                        calls.append(item)
+                        continue
+                    if "llm_first_sentence" not in trace.marks:
+                        trace.mark("llm_first_sentence")
+                    self.sentences.append(item)
+                    text += item + " "
+                    await tts.speak(tts_ws, item)
+                if not calls:
+                    break
+
+                filler = random.choice(FILLERS)
+                if "llm_first_sentence" not in trace.marks:
                     trace.mark("llm_first_sentence")
-                self.sentences.append(sentence)
-                await tts.speak(tts_ws, sentence)
+                self.sentences.append(filler)
+                await tts.speak(tts_ws, filler)
+
+                results = []
+                for call in calls:
+                    started = time.perf_counter()
+                    result = await tools.run(call.name, json.loads(call.arguments or "{}"))
+                    tool_ms += round((time.perf_counter() - started) * 1000)
+                    results.append({
+                        "role": "tool",
+                        "tool_call_id": call.id,
+                        "content": json.dumps(result),
+                    })
+                self.messages += [
+                    {
+                        "role": "assistant",
+                        "content": text or None,
+                        "tool_calls": [call.as_message() for call in calls],
+                    },
+                    *results,
+                ]
+                stream = llm.chat_stream(self.messages)
             trace.mark("llm_done")
 
             await tts.close(tts_ws)
@@ -272,10 +316,22 @@ class Session:
                 forward.cancel()
                 try:
                     await forward
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
                     pass
             if tts_ws is not None:
                 await tts_ws.close()
+            return
+        except Exception:
+            log.exception("turn failed")
+            if forward is not None:
+                forward.cancel()
+                try:
+                    await forward
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if tts_ws is not None:
+                await tts_ws.close()
+            await self.ws.send_json({"type": "error", "message": "Something went wrong, please try again"})
             return
 
         reply = " ".join(self.sentences)
@@ -290,6 +346,7 @@ class Session:
             "reply": reply,
             "provider": llm.last_provider,
             "speculated": speculated,
+            "tool_ms": tool_ms,
             "timings": {
                 "turn_detection": turn_detection_ms,
                 "stt": trace.marks["stt_done"],

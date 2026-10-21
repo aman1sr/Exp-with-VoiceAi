@@ -1,5 +1,5 @@
-import { startCapture } from "./capture.js?v=p7-1";
-import { Player } from "./playback.js?v=p7-1";
+import { startCapture } from "./capture.js?v=p8-1";
+import { Player } from "./playback.js?v=p8-1";
 
 const $ = (id) => document.getElementById(id);
 
@@ -146,9 +146,10 @@ function showStartError(message) {
   $("start").disabled = false;
 }
 
-function addTurn({ transcript, reply, provider, speculated, timings: t }) {
+function addTurn({ transcript, reply, provider, speculated, tool_ms, timings: t }) {
   if (provider) reply += " (" + provider + ")";
   if (speculated) reply += " [LLM started early]";
+  if (tool_ms) reply += " [tool call: " + tool_ms + " ms]";
   const v2v = $("v2v").textContent;
   const timing = (name) => Number.isFinite(t?.[name]) ? t[name] : "—";
   const bar = (name, ms) => `<span class="${name}" style="width:${Number.isFinite(ms) ? ms / 10 : 0}px"></span>`;
